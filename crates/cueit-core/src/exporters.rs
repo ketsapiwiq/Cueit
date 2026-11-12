@@ -439,6 +439,57 @@ mod serato {
         d.extend_from_slice(payload);
     }
 
+    /// Encode data the way Serato wraps the `Markers2` payload: 54-byte blocks
+    /// separated by newlines, no padding, and the last character of a partial
+    /// block dropped (see Mixxx's `base64encode(data, chopPadding=true)`).
+    fn serato_base64(data: &[u8]) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::with_capacity(data.len() * 4 / 3 + data.len() / 54 + 1);
+        for (i, chunk) in data.chunks(54).enumerate() {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            let mut block = Vec::with_capacity(chunk.len().div_ceil(3) * 4);
+            for triple in chunk.chunks(3) {
+                let b0 = triple[0] as u32;
+                let b1 = *triple.get(1).unwrap_or(&0) as u32;
+                let b2 = *triple.get(2).unwrap_or(&0) as u32;
+                let n = (b0 << 16) | (b1 << 8) | b2;
+                block.push(ALPHABET[(n >> 18) as usize & 0x3F]);
+                block.push(ALPHABET[(n >> 12) as usize & 0x3F]);
+                if triple.len() > 1 {
+                    block.push(ALPHABET[(n >> 6) as usize & 0x3F]);
+                }
+                if triple.len() > 2 {
+                    block.push(ALPHABET[n as usize & 0x3F]);
+                }
+            }
+            if chunk.len() % 3 != 0 && !block.is_empty() {
+                // Serato chops the last character instead of emitting padding.
+                block.pop();
+            }
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
+    /// Build the ID3 `GEOB` payload for `Serato Markers2` on MP3/AIFF.
+    ///
+    /// Mixxx (and Serato) expect a nested layout: an outer `\x01\x01` version
+    /// marker followed by base64 of the *inner* `\x01\x01` + entries + NUL
+    /// payload, and the whole object pre-allocated to at least 470 bytes with
+    /// NUL padding. CueIt previously wrote the inner payload directly, which
+    /// made Mixxx discard the frame.
+    fn markers2_geob(cues: &[Cue], track_color: (u8, u8, u8)) -> Vec<u8> {
+        let inner = markers2_field(cues, track_color);
+        let mut out = vec![0x01, 0x01];
+        out.extend_from_slice(&serato_base64(&inner));
+        let size = if out.len() < 470 { 470 } else { out.len() + 1 };
+        out.resize(size, 0x00);
+        out
+    }
+
     fn markers2_field(cues: &[Cue], track_color: (u8, u8, u8)) -> Vec<u8> {
         let mut d = Vec::new();
         d.extend_from_slice(&VERSION2.to_be_bytes());
@@ -474,7 +525,8 @@ mod serato {
                 e.extend_from_slice(&serato32(0).to_be_bytes());
                 e.extend_from_slice(&[0x00, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f]);
                 e.extend_from_slice(&color32.to_be_bytes());
-                e.extend_from_slice(&[0x00, 0x00]);
+                // Set cue: type Cue (1), not locked.
+                e.extend_from_slice(&[0x01, 0x00]);
             } else {
                 let color32 = serato32(0x7F7F7F);
                 e.push(0x7f);
@@ -496,7 +548,9 @@ mod serato {
             e.extend_from_slice(&NO_POSITION.to_be_bytes());
             e.extend_from_slice(&[0x00, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f]);
             e.extend_from_slice(&color32.to_be_bytes());
-            e.extend_from_slice(&[0x00, 0x01]);
+            // Loop slot: type Loop (3), unlocked. CueIt used to write
+            // type Unknown + locked, which Mixxx rejects outright.
+            e.extend_from_slice(&[0x03, 0x00]);
             entries.push(e);
         }
         let (tr, tg, tb) = TRACK_COLOR;
@@ -537,7 +591,7 @@ mod serato {
             })
             .collect();
 
-        let markers2 = markers2_field(&adjusted, TRACK_COLOR);
+        let markers2 = markers2_geob(&adjusted, TRACK_COLOR);
         let markers_ = markers_field(&adjusted);
 
         tag.remove("GEOB");
@@ -754,6 +808,177 @@ mod serato_tests {
         assert_eq!(geobs.len(), 2, "expected Serato Markers_ and Markers2");
         assert_eq!(tag.get("TKEY").and_then(|f| f.content().text()).map(|s| s.to_string()).as_deref(), Some("8A"));
         assert_eq!(tag.get("TBPM").and_then(|f| f.content().text()).map(|s| s.to_string()).as_deref(), Some("128"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Serato stores the Markers2 payload in a nested base64 layer. Decode it
+    /// the way Mixxx does (`QByteArray::fromBase64`, which tolerates the
+    /// dropped trailing character) so the test does not just mirror our encoder.
+    fn decode_lenient_base64(data: &[u8]) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut values = Vec::new();
+        for &byte in data {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            match ALPHABET.iter().position(|&c| c == byte) {
+                Some(value) => values.push(value as u32),
+                None => break,
+            }
+        }
+        let mut out = Vec::new();
+        for group in values.chunks(4) {
+            match group.len() {
+                4 => {
+                    let n = (group[0] << 18) | (group[1] << 12) | (group[2] << 6) | group[3];
+                    out.push((n >> 16) as u8);
+                    out.push((n >> 8) as u8);
+                    out.push(n as u8);
+                }
+                3 => {
+                    let n = (group[0] << 18) | (group[1] << 12) | (group[2] << 6);
+                    out.push((n >> 16) as u8);
+                    out.push((n >> 8) as u8);
+                }
+                2 => {
+                    let n = (group[0] << 18) | (group[1] << 12);
+                    out.push((n >> 16) as u8);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn geob_payload(tag: &id3::Tag, description: &str) -> Vec<u8> {
+        tag.frames()
+            .find_map(|frame| match frame.content() {
+                id3::frame::Content::EncapsulatedObject(obj)
+                    if obj.description == description =>
+                {
+                    Some(obj.data.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing GEOB frame {description:?}"))
+    }
+
+    /// Parse `\x01\x01` + len-prefixed entries, as done by Mixxx.
+    fn parse_entries(inner: &[u8]) -> Vec<(String, Vec<u8>)> {
+        assert_eq!(&inner[..2], &[0x01, 0x01], "missing inner version prefix");
+        let mut offset = 2;
+        let mut entries = Vec::new();
+        while offset < inner.len() {
+            let end = offset
+                + inner[offset..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .expect("unterminated entry name");
+            let name = String::from_utf8(inner[offset..end].to_vec()).unwrap();
+            offset = end + 1;
+            if name.is_empty() {
+                break;
+            }
+            let len = u32::from_be_bytes(
+                inner[offset..offset + 4].try_into().expect("truncated entry length"),
+            ) as usize;
+            offset += 4;
+            entries.push((name, inner[offset..offset + len].to_vec()));
+            offset += len;
+        }
+        entries
+    }
+
+    fn write_sample_file() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cueit_serato_markers_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("song.mp3");
+        std::fs::write(&file, [0xFFu8, 0xFB, 0x90, 0x00, 0, 0, 0, 0]).unwrap();
+
+        let track = TrackData {
+            path: file.to_string_lossy().into_owned(),
+            analysis: AnalysisResult {
+                bpm: 128.0,
+                key: "A".into(),
+                scale: "minor".into(),
+                camelot: "8A".into(),
+                ..Default::default()
+            },
+            cues: vec![
+                Cue::new("Intro", 0.0, "#1DB954"),
+                Cue::new("Drop", 32.0, "#E91E63"),
+            ],
+        };
+        export_serato(&track).unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn serato_markers2_uses_nested_base64_format() {
+        let (dir, file) = write_sample_file();
+        let tag = id3::Tag::read_from_path(&file).unwrap();
+        let payload = geob_payload(&tag, "Serato Markers2");
+
+        // Mixxx expects `\x01\x01` + base64(inner), padded with NULs to 470.
+        assert_eq!(&payload[..2], &[0x01, 0x01], "missing outer version prefix");
+        assert!(payload.len() >= 470, "Markers2 must be pre-allocated to 470 bytes");
+        assert!(payload[2..].ends_with(&[0x00]), "payload must be NUL padded");
+
+        let inner = decode_lenient_base64(&payload[2..]);
+        let entries = parse_entries(&inner);
+        assert!(entries.iter().any(|(name, _)| name == "COLOR"));
+        assert!(entries.iter().any(|(name, _)| name == "BPMLOCK"));
+
+        let cues: Vec<&Vec<u8>> = entries
+            .iter()
+            .filter(|(name, _)| name == "CUE")
+            .map(|(_, data)| data)
+            .collect();
+        assert_eq!(cues.len(), 2);
+
+        // CUE layout: 0, index, u32 position_ms, 0, R, G, B, 0, 0, label, 0
+        assert_eq!(cues[0][1], 0);
+        assert_eq!(u32::from_be_bytes(cues[0][2..6].try_into().unwrap()), 0);
+        assert_eq!(&cues[0][7..10], &[0x1D, 0xB9, 0x54]);
+        assert_eq!(&cues[0][12..], b"Intro\0");
+
+        assert_eq!(cues[1][1], 1);
+        assert_eq!(u32::from_be_bytes(cues[1][2..6].try_into().unwrap()), 32_000);
+        assert_eq!(&cues[1][12..], b"Drop\0");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn serato_markers_legacy_uses_loop_type_for_loop_slots() {
+        let (dir, file) = write_sample_file();
+        let tag = id3::Tag::read_from_path(&file).unwrap();
+        let payload = geob_payload(&tag, "Serato Markers_");
+        assert_eq!(payload.len(), 6 + 14 * 22 + 4);
+
+        // Set cue slots are type Cue (1), unset slots type Unknown (0, which
+        // Mixxx maps to Cue). Loop slots 5..13 must be type Loop (3), unlocked:
+        // Mixxx rejects the whole frame if a locked entry is not a loop.
+        for i in 0..2 {
+            let entry = &payload[6 + i * 22..6 + (i + 1) * 22];
+            assert_eq!(entry[20], 0x01, "set cue slot {i} must be type Cue");
+            assert_eq!(entry[21], 0x00);
+        }
+        for i in 2..5 {
+            let entry = &payload[6 + i * 22..6 + (i + 1) * 22];
+            assert_eq!(entry[20], 0x00, "unset cue slot {i} must be type Unknown");
+            assert_eq!(entry[21], 0x00);
+        }
+        for i in 5..14 {
+            let entry = &payload[6 + i * 22..6 + (i + 1) * 22];
+            assert_eq!(entry[20], 0x03, "loop slot {i} must be type Loop");
+            assert_eq!(entry[21], 0x00, "loop slot {i} must not be locked");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
